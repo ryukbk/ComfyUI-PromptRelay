@@ -70,6 +70,11 @@ class TimelineEditor {
     this.localPromptsWidget = node.widgets.find(w => w.name === "local_prompts");
     this.segmentLengthsWidget = node.widgets.find(w => w.name === "segment_lengths");
 
+    // Last value resolved from a connected max_frames input (null = not connected
+    // or upstream value not knowable on the frontend). Used to detect changes so
+    // the gauge can follow an upstream node before the workflow is run.
+    this._lastResolvedMax = null;
+
     this.timeline = parseInitial(this.timelineDataWidget?.value, this.getMaxFrames());
     this.selectedIndex = 0;
     this.hoverIndex = -1;
@@ -87,6 +92,9 @@ class TimelineEditor {
 
     this.buildDOM();
     this.bindEvents();
+    // Adopt an already-connected max_frames value (e.g. a workflow loaded with
+    // the input wired) before the first paint.
+    this.syncConnectedMaxFrames();
     this.syncWidgetsFromTimeline();
     this.updateUIFromSelection();
     this.render();
@@ -94,6 +102,81 @@ class TimelineEditor {
 
   getMaxFrames() {
     return Math.max(1, parseInt(this.maxFramesWidget?.value, 10) || 1);
+  }
+
+  // Walk the graph backward from the max_frames input and return the upstream
+  // value if the frontend can know it without running the workflow (i.e. the
+  // source node exposes it as a widget value or a literal output). Returns null
+  // when max_frames isn't connected, or when the upstream value is only computed
+  // server-side and therefore can't be previewed.
+  resolveConnectedMaxFrames() {
+    const node = this.node;
+    const graph = node?.graph;
+    if (!graph) return null;
+
+    const inputIndex = node.inputs?.findIndex(i => i.name === "max_frames");
+    if (inputIndex == null || inputIndex < 0) return null;
+    const input = node.inputs[inputIndex];
+    if (input?.link == null) return null;  // not connected
+
+    // Follow links backward, hopping through Reroute nodes, with a small guard
+    // against cycles / very long chains.
+    let linkId = input.link;
+    const seen = new Set();
+    for (let hops = 0; hops < 64; hops++) {
+      if (linkId == null || seen.has(linkId)) return null;
+      seen.add(linkId);
+      const link = graph.links?.[linkId];
+      if (!link) return null;
+      const srcNode = graph.getNodeById?.(link.origin_id);
+      if (!srcNode) return null;
+
+      // A Reroute passes its single input through — keep walking upstream.
+      const isReroute = srcNode.type === "Reroute" || srcNode.comfyClass === "Reroute";
+      if (isReroute && srcNode.inputs?.[0]?.link != null) {
+        linkId = srcNode.inputs[0].link;
+        continue;
+      }
+
+      // Prefer a widget on the source whose value drives this output (covers
+      // PrimitiveNode and most Int sources). Fall back to a named widget, then
+      // to any literal output value the source may carry.
+      const w = srcNode.widgets?.find(x => x.name === "value")
+             ?? srcNode.widgets?.find(x => x.name === "max_frames")
+             ?? (srcNode.widgets?.length === 1 ? srcNode.widgets[0] : null);
+      if (w != null) {
+        const v = parseInt(w.value, 10);
+        return Number.isFinite(v) ? v : null;
+      }
+
+      const outVal = srcNode.outputs?.[link.origin_slot]?._data;
+      if (outVal != null) {
+        const v = parseInt(outVal, 10);
+        return Number.isFinite(v) ? v : null;
+      }
+      return null;  // upstream value not knowable on the frontend
+    }
+    return null;
+  }
+
+  // If a connected upstream max_frames value is knowable and has changed, push it
+  // into the widget and refit the timeline. Returns true if anything changed.
+  syncConnectedMaxFrames() {
+    const resolved = this.resolveConnectedMaxFrames();
+    if (resolved == null) {
+      this._lastResolvedMax = null;
+      return false;
+    }
+    if (resolved === this._lastResolvedMax) return false;
+    this._lastResolvedMax = resolved;
+    if (this.maxFramesWidget && this.maxFramesWidget.value !== resolved) {
+      this.maxFramesWidget.value = resolved;
+      this.trimToFit();
+      this.commit();
+      this.updateUIFromSelection();
+      return true;
+    }
+    return false;
   }
 
   getFps() {
@@ -928,6 +1011,29 @@ app.registerExtension({
         return onRemoved?.apply(this, arguments);
       };
 
+      // When the max_frames input is connected/disconnected, immediately try to
+      // adopt the upstream value so the gauge reflects it without a run.
+      const onConnectionsChange = this.onConnectionsChange;
+      this.onConnectionsChange = function (type, index, connected, link_info, ioSlot) {
+        const out = onConnectionsChange?.apply(this, arguments);
+        if (this._timelineEditor && this._timelineEditor.syncConnectedMaxFrames()) {
+          this._timelineEditor.render();
+        }
+        return out;
+      };
+
+      // While max_frames is wired to an upstream node, that node can change its
+      // value (e.g. you edit a Primitive's widget) without notifying us. The node
+      // redraw is the one signal we reliably get on the canvas, so poll the
+      // resolved value here and refit only when it actually changes.
+      const onDrawForeground = this.onDrawForeground;
+      this.onDrawForeground = function (ctx, gfx) {
+        if (this._timelineEditor && this._timelineEditor.syncConnectedMaxFrames()) {
+          this._timelineEditor.render();
+        }
+        return onDrawForeground?.apply(this, arguments);
+      };
+
       const onConfigure = this.onConfigure;
       this.onConfigure = function (info) {
         const out = onConfigure?.apply(this, arguments);
@@ -938,6 +1044,9 @@ app.registerExtension({
         // Rebuild from restored widget values
         setTimeout(() => {
           if (this._timelineEditor) {
+            // Adopt a connected upstream max_frames first so the restored timeline
+            // is fit to the live value rather than the saved widget value.
+            this._timelineEditor.syncConnectedMaxFrames();
             this._timelineEditor.timeline = parseInitial(
               this._timelineEditor.timelineDataWidget?.value,
               this._timelineEditor.getMaxFrames(),
